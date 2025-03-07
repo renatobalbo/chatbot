@@ -44,9 +44,7 @@ async function generateXmlReport(movimentacoes, carteira, periodo, filePath) {
 
     await workbook.xlsx.writeFile(filePath);
 
-    if (fs.existsSync(filePath)) {
-      console.log(`Relatório salvo com sucesso em: ${filePath}`);
-    } else {
+    if (!fs.existsSync(filePath)) {
       console.error('Arquivo não encontrado após tentativa de gravação!');
     }
 

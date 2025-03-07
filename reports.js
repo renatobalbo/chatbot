@@ -7,6 +7,7 @@ const git = simpleGit();
 const { getConnection } = require('./database');
 const { generateXmlReport } = require('./reportXml');
 const { generatePdfReport } = require('./reportPdf');
+const { MessageMedia } = require('whatsapp-web.js');
 
 const userState = {}; // Controle de estado por usuário
 
@@ -59,7 +60,7 @@ class FileHostingService {
         .push('origin', this.branchName);
 
       // URL pública do GitHub Pages
-      return `https://renatobalbo.github.io/chatbot/${fileName}`;
+      return `https://github.com/renatobalbo/chatbot/raw/reports/github-reports/${fileName}`;
     } catch (error) {
       console.error('Erro ao hospedar arquivo:', error);
       return null;
@@ -240,17 +241,8 @@ async function generateStatementReport(client, msg, format) {
       const publicUrl = await fileHosting.hostFile(filePath, fileName);
 
       // Enviar mensagem com URL do arquivo
-      if (publicUrl) {
-        await client.sendMessage(user, {
-          document: { 
-            url: publicUrl, 
-            filename: fileName 
-          },
-          caption: 'Seu relatório está pronto!'
-        });
-      } else {
-        await client.sendMessage(user, 'Erro ao gerar URL do relatório.');
-      }
+      const media = await MessageMedia.fromUrl(publicUrl);
+      await client.sendMessage(user, media);
 
       // Limpar arquivos antigos
       await fileHosting.cleanupOldFiles();

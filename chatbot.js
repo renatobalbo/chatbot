@@ -124,8 +124,6 @@ const saveTransactionToDB = async (user, tipo, valor, carteiraCodigo, categoria)
             .input('Carteira', sql.Int, carteiraID)
             .input('Categoria', sql.Int, categoria)
             .query("INSERT INTO Movimentacoes (Usuario, Data, Tipo, Valor, Carteira, Categoria) VALUES (@Usuario, @Data, @Tipo, @Valor, @Carteira, @Categoria)");
-
-        console.log('Movimentação salva no banco!');
     } catch (err) {
         console.error('Erro ao salvar movimentação:', err.message);
     }
@@ -267,7 +265,6 @@ client.on('message', async msg => {
     // Submenu Relatórios
     if (userState[user]?.etapa === 'menu_relatorios' && ['1', '2'].includes(message)) {
         const format = message === '1' ? 'pdf' : 'xml';
-        console.log(`Chamando generateStatementReport com formato: ${format}`); // Aqui dentro tá tudo certo
         generateStatementReport(client, msg, format);
     }
  

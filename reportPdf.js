@@ -2,6 +2,7 @@ const pdfkit = require('pdfkit');
 const fs = require('fs');
 const path = require('path');
 const { getConnection, sql } = require('./database');
+const { registrarInteracao } = require('./interactionLog');
 
 // Função para obter ID da carteira pelo código garantindo comparação exata
 async function getCarteiraIdPorCodigo(usuario, codigo) {
@@ -13,9 +14,7 @@ async function getCarteiraIdPorCodigo(usuario, codigo) {
       console.error(`Código de carteira inválido: ${codigo}`);
       return null;
     }
-    
-    console.log(`Buscando carteira com código EXATO: ${codigoInt} (tipo: ${typeof codigoInt})`);
-    
+      
     const pool = await getConnection();
     const result = await pool.request()
       .input('Usuario', sql.NVarChar, usuario)
@@ -33,7 +32,6 @@ async function getCarteiraIdPorCodigo(usuario, codigo) {
       return null;
     }
     
-    console.log(`Carteira encontrada - ID: ${result.recordset[0].ID}, Código: ${codigoInt}`);
     return result.recordset[0].ID;
   } catch (error) {
     console.error('Erro ao obter ID da carteira:', error);
@@ -56,9 +54,7 @@ async function obterSaldoAtualCarteira(usuario, carteiraId) {
       console.error(`ID de carteira inválido: ${carteiraId}`);
       return 0;
     }
-    
-    console.log(`Calculando saldo para carteira ID EXATO: ${carteiraIdInt} (tipo: ${typeof carteiraIdInt})`);
-    
+        
     const pool = await getConnection();
     
     // Consulta de depuração: verificar se há movimentações para esta carteira
@@ -73,11 +69,6 @@ async function obterSaldoAtualCarteira(usuario, carteiraId) {
         WHERE Usuario = @Usuario AND Carteira = @Carteira
       `);
     
-    console.log(`Movimentações encontradas para carteira ${carteiraIdInt}:`, 
-                `Total: ${checkMovs.recordset[0].TotalMovs}, `,
-                `Créditos: ${checkMovs.recordset[0].TotalCreditos}, `,
-                `Débitos: ${checkMovs.recordset[0].TotalDebitos}`);
-    
     // Consulta principal: calcular saldo
     const result = await pool.request()
       .input('Usuario', sql.VarChar, usuario)
@@ -90,7 +81,6 @@ async function obterSaldoAtualCarteira(usuario, carteiraId) {
       `);
     
     const saldo = result.recordset[0]?.Saldo ?? 0;
-    console.log(`Saldo calculado para carteira ${carteiraIdInt}: ${saldo}`);
     return saldo;
   } catch (error) {
     console.error('Erro ao obter saldo atual da carteira:', error);
@@ -112,9 +102,7 @@ async function obterDescricaoCarteira(usuario, codigo) {
       console.error(`Código de carteira inválido para obter descrição: ${codigo}`);
       return `Carteira ${codigo}`;
     }
-    
-    console.log(`Buscando descrição da carteira código ${codigoInt} para usuário ${usuario}`);
-    
+        
     const pool = await getConnection();
     const result = await pool.request()
       .input('Usuario', sql.NVarChar, usuario)
@@ -139,6 +127,22 @@ async function obterDescricaoCarteira(usuario, codigo) {
 }
 
 async function generatePdfReport(movimentacoes, carteira, periodo, filePath, usuario, carteiraId) {
+  // Logs no início da função
+  await registrarInteracao(
+    usuario,
+    'PDF_GERACAO_INICIO',
+    'Início da geração do PDF',
+    null,
+    'geracao_pdf',
+    'INICIADO',
+    {
+      carteira,
+      periodo,
+      totalMovimentacoes: movimentacoes.length,
+      carteiraId
+    }
+  );
+
   // Obter o saldo atual da carteira
   let saldoAtual = 0;
   let descricaoCarteira = '';
@@ -146,15 +150,32 @@ async function generatePdfReport(movimentacoes, carteira, periodo, filePath, usu
   try {
     // Obter descrição da carteira
     descricaoCarteira = await obterDescricaoCarteira(usuario, carteira);
-    console.log(`Descrição da carteira obtida: ${descricaoCarteira}`);
+    // Log de sucesso da descrição
+    await registrarInteracao(
+      usuario,
+      'PDF_DESCRICAO_CARTEIRA',
+      carteira.toString(),
+      `Descrição obtida: ${descricaoCarteira}`,
+      'obter_descricao',
+      'SUCESSO',
+      { carteira, descricaoCarteira }
+    );
     
     if (carteiraId) {
       // Usar nova função para obter saldo atual
       saldoAtual = await obterSaldoAtualCarteira(usuario, carteiraId);
+
+      // Log de sucesso do saldo
+      await registrarInteracao(
+        usuario,
+        'PDF_SALDO_CARTEIRA',
+        carteiraId.toString(),
+        `Saldo obtido: ${saldoAtual}`,
+        'obter_saldo',
+        'SUCESSO',
+        { carteiraId, saldoAtual }
+      );
     } else if (carteira === '1' || carteira === 1) {
-      // Caso especial: Carteira Geral (código 1) - somar todas as movimentações do usuário
-      console.log(`Consultando saldo geral para o usuário ${usuario}`);
-      
       const pool = await getConnection();
       const result = await pool.request()
         .input('Usuario', sql.VarChar, usuario)
@@ -166,7 +187,6 @@ async function generatePdfReport(movimentacoes, carteira, periodo, filePath, usu
         `);
       
       saldoAtual = result.recordset[0]?.Saldo ?? 0;
-      console.log(`Saldo geral obtido: ${saldoAtual}`);
     } else {
       // Se por algum motivo não temos o carteiraId, vamos tentar obtê-lo novamente
       console.log(`Tentando obter ID da carteira com código ${carteira} para usuário ${usuario}`);
@@ -185,7 +205,16 @@ async function generatePdfReport(movimentacoes, carteira, periodo, filePath, usu
       }
     }
   } catch (error) {
-    console.error('Erro ao obter saldo atual da carteira:', error);
+    // Log de erro
+    await registrarInteracao(
+      usuario,
+      'PDF_ERRO_SALDO',
+      carteira?.toString() || 'desconhecida',
+      `Erro ao obter saldo: ${error.message}`,
+      'obter_saldo',
+      'ERRO',
+      { carteira, carteiraId, erro: error.message }
+    );
   }
 
   return new Promise((resolve, reject) => {
@@ -776,21 +805,36 @@ async function generatePdfReport(movimentacoes, carteira, periodo, filePath, usu
 
     // Garanta que o arquivo esteja completamente escrito antes de resolver a promise
     writeStream.on('finish', () => {
-      // Verificação adicional para garantir que o arquivo foi escrito corretamente
       fs.stat(filePath, (err, stats) => {
         if (err) {
+          // Log de erro no arquivo
+          registrarInteracao(usuario, 'PDF_ERRO_ARQUIVO', filePath, `Erro: ${err.message}`, 
+            'verificacao_arquivo', 'ERRO', { erro: err.message })
+            .catch(logErr => console.error('Erro ao registrar log:', logErr));
           reject(err);
         } else if (stats.size === 0) {
+          // Log de arquivo vazio
+          registrarInteracao(usuario, 'PDF_ARQUIVO_VAZIO', filePath, 'Arquivo vazio', 
+            'verificacao_arquivo', 'ERRO', { filePath })
+            .catch(logErr => console.error('Erro ao registrar log:', logErr));
           reject(new Error('Arquivo PDF gerado está vazio'));
         } else {
-          console.log(`PDF gerado com sucesso: ${filePath}, tamanho: ${stats.size} bytes`);
+          // Log de sucesso
+          registrarInteracao(usuario, 'PDF_GERACAO_SUCESSO', filePath, 
+            `PDF gerado: ${stats.size} bytes`, 'geracao_pdf', 'SUCESSO', 
+            { filePath, tamanhoBytes: stats.size, movimentacoes: movimentacoes?.length || 0 })
+            .catch(logErr => console.error('Erro ao registrar log:', logErr));
           resolve(filePath);
         }
       });
     });
     
     writeStream.on('error', (err) => {
-      console.error('Erro ao gravar PDF:', err);
+      // Log de erro na gravação
+      registrarInteracao(usuario, 'PDF_ERRO_GRAVACAO', filePath, 
+        `Erro: ${err.message}`, 'gravacao_arquivo', 'ERRO', 
+        { filePath, erro: err.message })
+        .catch(logErr => console.error('Erro ao registrar log:', logErr));
       reject(err);
     });
   });

@@ -7,6 +7,7 @@ const git = simpleGit();
 const { getConnection } = require('./database');
 const { generateXmlReport } = require('./reportXml');
 const { generatePdfReport } = require('./reportPdf');
+const { registrarInteracao } = require('./interactionLog');
 const { MessageMedia } = require('whatsapp-web.js');
 
 const userState = {}; // Controle de estado por usuário
@@ -22,9 +23,7 @@ async function getCarteiraIdPorCodigo(usuario, codigo) {
       console.error(`Código de carteira inválido: ${codigo}`);
       return null;
     }
-    
-    console.log(`Buscando carteira com código EXATO: ${codigoInt} (tipo: ${typeof codigoInt})`);
-    
+        
     const pool = await getConnection();
     const result = await pool.request()
       .input('Usuario', sql.NVarChar, usuario)
@@ -41,8 +40,7 @@ async function getCarteiraIdPorCodigo(usuario, codigo) {
       console.log(`Nenhuma carteira encontrada com código ${codigoInt} para usuário ${usuario}`);
       return null;
     }
-    
-    console.log(`Carteira encontrada - ID: ${result.recordset[0].ID}, Código: ${codigoInt}`);
+
     return result.recordset[0].ID;
   } catch (error) {
     console.error('Erro ao obter ID da carteira:', error);
@@ -234,12 +232,35 @@ async function generateStatementReport(client, msg, format) {
   // Verificar se já existe um processo em execução para este usuário
   if (processingUsers.has(user)) {
     console.log(`Operação já em andamento para o usuário ${user}`);
+
+    // Log de operação em andamento
+    await registrarInteracao(
+      user,
+      'RELATORIO_DUPLICADO',
+      format,
+      'Operação já em andamento para este usuário',
+      'verificacao_duplicidade',
+      'REJEITADO',
+      { format }
+    );
+
     return;
   }
   
   // Marcar este usuário como em processamento
   processingUsers.add(user);
   
+  // Log de início do processo
+  await registrarInteracao(
+    user,
+    'RELATORIO_INICIO',
+    format,
+    'Iniciando geração de relatório',
+    'inicio_processo',
+    'INICIADO',
+    { format }
+  );
+
   try {
     const fileHosting = new FileHostingService('./github-reports');
     
@@ -256,7 +277,6 @@ async function generateStatementReport(client, msg, format) {
     
     // Etapa 1: Verificação de carteira
     if (continueFlow && userState[user].etapa === 'carteira') {
-      console.log(`Processando etapa carteira para ${user}`);
       
       const pool = await getConnection();
       const carteirasResult = await pool.request()
@@ -291,7 +311,6 @@ async function generateStatementReport(client, msg, format) {
             userState[user].carteira = carteiraPessoal.Codigo;
           }
           userState[user].etapa = 'opcao_periodo';
-          console.log(`Carteira selecionada automaticamente: ${userState[user].carteira}`);
         } else {
           // Caso tenha mais de uma carteira, pergunta qual utilizar
           let carteirasMsg = 'Escolha uma carteira:\n';
@@ -302,14 +321,23 @@ async function generateStatementReport(client, msg, format) {
           const carteiraMsg = await getUserResponse(client, user, carteirasMsg);
           const carteiraSelecionada = carteiraMsg.body.trim();
           
-          console.log(`Carteira selecionada pelo usuário: "${carteiraSelecionada}"`);
-          console.log('Carteiras disponíveis:', carteiras.map(c => `"${c.Codigo}"`));
-          
           // Verificar se a carteira selecionada existe na lista (com tratamento melhorado)
           const carteiraCodigoInt = parseInt(carteiraSelecionada, 10);
           
           if (isNaN(carteiraCodigoInt)) {
             await client.sendMessage(user, 'Código de carteira inválido. Por favor, escolha um número da lista.');
+            
+            // Log de erro - carteira inválida
+            await registrarInteracao(
+              user,
+              'RELATORIO_ERRO_CARTEIRA',
+              carteiraSelecionada,
+              'Código de carteira inválido',
+              'selecao_carteira',
+              'ERRO',
+              { valorInformado: carteiraSelecionada }
+            );
+
             processingUsers.delete(user);
             return;
           }
@@ -324,14 +352,12 @@ async function generateStatementReport(client, msg, format) {
           
           userState[user].carteira = carteiraEncontrada.Codigo;
           userState[user].etapa = 'opcao_periodo';
-          console.log(`Usuário selecionou carteira: ${userState[user].carteira}`);
         }
       }
     }
 
     // NOVA ETAPA: Opções de período
     if (continueFlow && userState[user].etapa === 'opcao_periodo') {
-      console.log(`Processando etapa opção de período para ${user}`);
       
       const opcoesPeriodoMsg = 
         'Escolha o período do extrato:\n' +
@@ -366,7 +392,6 @@ async function generateStatementReport(client, msg, format) {
 
     // Etapa 2: Informação de período (apenas se escolher período específico)
     if (continueFlow && userState[user].etapa === 'periodo') {
-      console.log(`Processando etapa período específico para ${user}`);
       
       if (!userState[user].periodo) {
         const dataAtual = formatDateToBR(new Date());
@@ -406,6 +431,22 @@ async function generateStatementReport(client, msg, format) {
         // Validar formato das datas
         if (!isValidDate(dataInicio) || !isValidDate(dataFim)) {
           await client.sendMessage(user, 'Formato de data inválido. Por favor, use o formato DD/MM/YYYY.');
+          
+          // Log de erro - formato de data inválido
+          await registrarInteracao(
+            user,
+            'RELATORIO_ERRO_DATA',
+            periodoInput,
+            'Formato de data inválido',
+            'selecao_periodo',
+            'ERRO',
+            { 
+              dataInicio,
+              dataFim,
+              formatoEsperado: 'DD/MM/YYYY'
+            }
+          );
+          
           processingUsers.delete(user);
           return;
         }
@@ -447,7 +488,6 @@ async function generateStatementReport(client, msg, format) {
 
     // Etapa 3: Geração do relatório
     if (continueFlow && userState[user].etapa === 'finalizado') {
-      console.log(`Gerando relatório para ${user}`);
       
       const { carteira, periodo } = userState[user];
       const dataInicioISO = convertToISO(periodo.dataInicio, false);
@@ -457,9 +497,6 @@ async function generateStatementReport(client, msg, format) {
 
       // Processamento do ID da carteira
       let carteiraId = null;
-
-      // Log para debug
-      console.log(`Carteira antes da validação: "${carteira}", tipo: ${typeof carteira}`);
 
       // Garantir que carteira seja um número
       const carteiraCodigo = parseInt(String(carteira).trim(), 10);
@@ -471,8 +508,6 @@ async function generateStatementReport(client, msg, format) {
         delete userState[user];
         return;
       }
-
-      console.log(`Carteira convertida para número: ${carteiraCodigo}`);
 
       // Obter o ID da carteira correspondente ao código
       const carteiraResult = await pool.request()
@@ -487,8 +522,6 @@ async function generateStatementReport(client, msg, format) {
       
       if (carteiraResult.recordset.length > 0) {
         carteiraId = carteiraResult.recordset[0].ID;
-        console.log(`ID da carteira ${carteiraCodigo} encontrado: ${carteiraId}`);
-        console.log(`Descrição da carteira: ${carteiraResult.recordset[0].Descricao}`);
       } else {
         console.log(`Nenhuma carteira encontrada com código ${carteiraCodigo}`);
         await client.sendMessage(user, 'Carteira não encontrada. Por favor, tente novamente.');
@@ -508,10 +541,6 @@ async function generateStatementReport(client, msg, format) {
           FROM Movimentacoes 
           WHERE Usuario = @usuario AND Carteira = @carteiraId
         `);
-      
-      console.log(`Verificação: ${verificaMovs.recordset[0].Total} movimentações encontradas para a carteira ID ${carteiraId}`);
-      console.log(`Soma de Créditos: ${verificaMovs.recordset[0].SomaCreditos || 0}`);
-      console.log(`Soma de Débitos: ${verificaMovs.recordset[0].SomaDebitos || 0}`);
 
       // Consulta para obter as movimentações com JOIN para carteiras
       let consultaSQL = `
@@ -532,12 +561,6 @@ async function generateStatementReport(client, msg, format) {
         AND m.Data BETWEEN @dataInicio AND @dataFim
         ORDER BY m.Data ASC
       `;
-
-      console.log(`Executando consulta SQL com os parâmetros: 
-        usuario: ${user} 
-        carteiraId: ${carteiraId} 
-        dataInicio: ${dataInicioISO} 
-        dataFim: ${dataFimISO}`);
       
       const result = await pool.request()
         .input('usuario', sql.VarChar, user)
@@ -548,15 +571,6 @@ async function generateStatementReport(client, msg, format) {
         .query(consultaSQL);
 
       const movimentacoes = result.recordset;
-      console.log(`Encontradas ${movimentacoes.length} movimentações para o período`);
-
-      // Log detalhado das primeiras movimentações para verificação
-      if (movimentacoes.length > 0) {
-        console.log("Amostra das movimentações encontradas:");
-        for (let i = 0; i < Math.min(3, movimentacoes.length); i++) {
-          console.log(`Mov ${i+1}: Data=${movimentacoes[i].Data}, Valor=${movimentacoes[i].Valor}, Carteira=${movimentacoes[i].CarteiraCodigo}-${movimentacoes[i].CarteiraDescricao}`);
-        }
-      }
 
       const reportsDir = path.join(__dirname, 'github-reports');
       if (!fs.existsSync(reportsDir)) {
@@ -567,40 +581,72 @@ async function generateStatementReport(client, msg, format) {
       const filePath = path.join(reportsDir, fileName);
 
       if (format === 'pdf') {
-        // Passar todos os parâmetros necessários incluindo o usuario e carteiraId
         await generatePdfReport(movimentacoes, carteiraCodigo, periodo, filePath, user, carteiraId);
       } else if (format === 'xml') {
-        await generateXmlReport(movimentacoes, carteiraCodigo, periodo, filePath);
+        await generateXmlReport(movimentacoes, carteiraCodigo, periodo, filePath, user);
       }
 
       try {
         // Hospedar arquivo no GitHub
         const publicUrl = await fileHosting.hostFile(filePath, fileName);
-
+    
         // Verificar se publicUrl existe e é válido
         if (publicUrl) {
           // Enviar mensagem com URL do arquivo
           const media = await MessageMedia.fromUrl(publicUrl);
           await client.sendMessage(user, media);
+          
+          // Log de envio bem-sucedido
+          await registrarInteracao(
+            user,
+            'RELATORIO_ENVIADO',
+            'Envio de relatório',
+            'Relatório enviado via URL',
+            'envio_relatorio',
+            'SUCESSO',
+            { 
+              publicUrl,
+              fileName
+            }
+          );
         } else {
           // Se a URL for null ou inválida, envia o arquivo diretamente
           const mediaLocal = MessageMedia.fromFilePath(filePath);
           await client.sendMessage(user, mediaLocal, {
             caption: 'Seu relatório está pronto.'
           });
+          
+          // Log de envio local
+          await registrarInteracao(
+            user,
+            'RELATORIO_ENVIADO',
+            'Envio de relatório',
+            'Relatório enviado localmente',
+            'envio_relatorio',
+            'SUCESSO_LOCAL',
+            { 
+              filePath,
+              fileName
+            }
+          );
         }
       } catch (uploadError) {
         console.error('Erro ao tentar hospedar/enviar arquivo:', uploadError);
-        // Fallback para envio local em caso de erro no GitHub
-        try {
-          const mediaLocal = MessageMedia.fromFilePath(filePath);
-          await client.sendMessage(user, mediaLocal, {
-            caption: 'Seu relatório está pronto (enviado localmente devido a um erro no upload).'
-          });
-        } catch (localError) {
-          console.error('Erro ao enviar arquivo localmente:', localError);
-          await client.sendMessage(user, 'Não foi possível enviar o relatório. Por favor, tente novamente mais tarde.');
-        }
+        
+        // Log de erro no upload
+        await registrarInteracao(
+          user,
+          'RELATORIO_ERRO_UPLOAD',
+          'Envio de relatório',
+          'Erro ao hospedar/enviar arquivo',
+          'envio_relatorio',
+          'ERRO',
+          { 
+            erro: uploadError.message,
+            filePath,
+            fileName
+          }
+        );
       }
 
       // Limpar arquivos antigos
@@ -612,6 +658,23 @@ async function generateStatementReport(client, msg, format) {
   } catch (error) {
     console.error('Erro ao gerar relatório:', error);
     await client.sendMessage(msg.from, 'Ocorreu um erro ao gerar o relatório. Por favor, tente novamente.');
+
+    // Log de erro
+    await registrarInteracao(
+      user,
+      'RELATORIO_ERRO',
+      format,
+      'Ocorreu um erro ao gerar o relatório',
+      'geracao_relatorio',
+      'ERRO',
+      { 
+        format,
+        carteira: userState[user]?.carteira,
+        periodo: userState[user]?.periodo,
+        erro: error.message
+      }
+    );
+
     delete userState[msg.from];
   } finally {
     // Remover o usuário da lista de processamento, independente do resultado

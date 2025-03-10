@@ -4,6 +4,7 @@ const qrcode = require('qrcode-terminal');
 const { Client } = require('whatsapp-web.js');
 
 const { getConnection, sql } = require('./database');
+const { registrarInteracao } = require('./interactionLog');
 const { generateStatementReport } = require('./reports');
 const { getCarteiras, saveCarteiraToDB, getCarteiraIdPorCodigo, consultarSaldo, exibirSaldo, listarCarteiras } = require('./wallets');
 const { getCategorias, saveCategoriaToDB, checkCategoriaExists, checkCategoriaInUse, deleteCategoriaFromDB, listCategorias, listarCategorias } = require('./categories');
@@ -46,7 +47,20 @@ const saveTransactionToDB = async (user, tipo, valor, carteiraCodigo, categoria)
             .query("SELECT ID FROM Carteiras WHERE Codigo = @Codigo AND (Usuario = @Usuario OR Usuario = 'GERAL')");
 
         if (carteiraResult.recordset.length === 0) {
-            throw new Error(`Carteira com código ${carteiraCodigo} não encontrada.`);
+            const erro = `Carteira com código ${carteiraCodigo} não encontrada.`;
+            
+            // Log de erro na carteira
+            await registrarInteracao(
+                user,
+                'ERRO_CARTEIRA',
+                carteiraCodigo.toString(),
+                erro,
+                'consulta_carteira',
+                'ERRO',
+                { carteiraCodigo }
+            );
+            
+            throw new Error(erro);
         }
 
         const carteiraID = carteiraResult.recordset[0].ID;
@@ -59,8 +73,43 @@ const saveTransactionToDB = async (user, tipo, valor, carteiraCodigo, categoria)
             .input('Carteira', sql.Int, carteiraID)
             .input('Categoria', sql.Int, categoria)
             .query("INSERT INTO Movimentacoes (Usuario, Data, Tipo, Valor, Carteira, Categoria) VALUES (@Usuario, @Data, @Tipo, @Valor, @Carteira, @Categoria)");
+        
+        // Log de sucesso na transação
+        await registrarInteracao(
+            user,
+            'TRANSACAO',
+            'saveTransactionToDB',
+            `Transação ${tipo} salva com sucesso`,
+            'banco_dados',
+            'SUCESSO',
+            {
+                tipo,
+                valor: parseFloat(valor),
+                carteiraID,
+                categoria
+            }
+        );
     } catch (err) {
         console.error('Erro ao salvar movimentação:', err.message);
+        
+        // Log de erro na transação
+        await registrarInteracao(
+            user,
+            'TRANSACAO',
+            'saveTransactionToDB',
+            `Erro: ${err.message}`,
+            'banco_dados',
+            'ERRO',
+            {
+                tipo,
+                valor,
+                carteiraCodigo,
+                categoria,
+                erro: err.message
+            }
+        );
+        
+        throw err; // Re-throw para tratamento superior
     }
 };
 
@@ -69,6 +118,17 @@ client.on('message', async msg => {
     const user = msg.from;
     const message = msg.body.trim();
 
+    // Log de recebimento de cada mensagem
+    await registrarInteracao(
+        user,
+        'MENSAGEM_RECEBIDA',
+        message,
+        null,
+        userState[user]?.etapa || 'inicio',
+        'RECEBIDO',
+        {}
+    );
+
     if (!userState[user]) {
         userState[user] = {};
     }
@@ -76,10 +136,20 @@ client.on('message', async msg => {
     // Chamada do Menu Principal.
     if (message.toLowerCase() === 'menu') {
         userState[user] = { etapa: 'menu' };
-        await client.sendMessage(user, 'Menu Principal:\n1 - Entradas\n2 - Saídas\n3 - Ver Saldo\n4 - Carteiras\n5 - Categorias\n6 - Relatórios');
-        return;
+        const menuMsg = 'Menu Principal:\n1 - Entradas\n2 - Saídas\n3 - Ver Saldo\n4 - Carteiras\n5 - Categorias\n6 - Relatórios';
+        await client.sendMessage(user, menuMsg);
+        
+        // Log do menu
+        await registrarInteracao(
+            user,
+            'MENU_PRINCIPAL',
+            message,
+            menuMsg,
+            'menu',
+            'EXIBIDO',
+            {}
+        );
     }
-
     if (userState[user]?.etapa === 'menu' && ['1', '2', '3', '4', '5', '6'].includes(message)) {
         switch (message) {
             case '1':
@@ -234,9 +304,49 @@ client.on('message', async msg => {
     }
 
     if (userState[user].etapa === 'confirmacao' && message.toLowerCase() === 'ok') {
-        await saveTransactionToDB(user, userState[user].tipo, userState[user].valor, userState[user].carteira, userState[user].categoria);
-        await client.sendMessage(user, 'Movimentação registrada com sucesso!');
-        delete userState[user];
+        try {
+            await saveTransactionToDB(user, userState[user].tipo, userState[user].valor, userState[user].carteira, userState[user].categoria);
+            
+            const mensagemSucesso = 'Movimentação registrada com sucesso!';
+            await client.sendMessage(user, mensagemSucesso);
+            
+            // Log da transação bem-sucedida
+            await registrarInteracao(
+                user,
+                userState[user].tipo === 'Crédito' ? 'ENTRADA_FINANCEIRA' : 'SAIDA_FINANCEIRA',
+                message,
+                mensagemSucesso,
+                'confirmacao',
+                'SUCESSO',
+                {
+                    valor: userState[user].valor,
+                    carteira: userState[user].carteira,
+                    categoria: userState[user].categoria
+                }
+            );
+            
+            delete userState[user];
+        } catch (error) {
+            console.error('Erro ao salvar transação:', error);
+            const mensagemErro = 'Erro ao registrar movimentação. Tente novamente.';
+            await client.sendMessage(user, mensagemErro);
+            
+            // Log de erro
+            await registrarInteracao(
+                user,
+                userState[user].tipo === 'Crédito' ? 'ENTRADA_FINANCEIRA' : 'SAIDA_FINANCEIRA',
+                message,
+                mensagemErro,
+                'confirmacao',
+                'ERRO',
+                {
+                    valor: userState[user].valor,
+                    carteira: userState[user].carteira,
+                    categoria: userState[user].categoria,
+                    erro: error.message
+                }
+            );
+        }
         return;
     }
 
@@ -256,8 +366,23 @@ client.on('message', async msg => {
     
     if (userState[user]?.etapa === 'tipo_carteira') {
         if (message.toLowerCase() === 'cancelar') {
+            const etapaAnterior = userState[user]?.etapa || 'desconhecida';
+            const operacaoAtual = userState[user]?.tipo || 'OPERACAO';
             delete userState[user];
-            await client.sendMessage(user, 'Operação cancelada com sucesso.');
+            
+            const mensagemCancelamento = 'Operação cancelada.';
+            await client.sendMessage(user, mensagemCancelamento);
+            
+            // Log do cancelamento
+            await registrarInteracao(
+                user,
+                'CANCELAMENTO',
+                message,
+                mensagemCancelamento,
+                etapaAnterior,
+                'CANCELADO',
+                { operacao: operacaoAtual }
+            );
             return;
         }
         const tiposCarteira = {
@@ -290,8 +415,23 @@ client.on('message', async msg => {
 
     if (userState[user]?.etapa === 'descricao_categoria') {
         if (message.toLowerCase() === 'cancelar') {
+            const etapaAnterior = userState[user]?.etapa || 'desconhecida';
+            const operacaoAtual = userState[user]?.tipo || 'OPERACAO';
             delete userState[user];
-            await client.sendMessage(user, 'Operação cancelada com sucesso.');
+            
+            const mensagemCancelamento = 'Operação cancelada.';
+            await client.sendMessage(user, mensagemCancelamento);
+            
+            // Log do cancelamento
+            await registrarInteracao(
+                user,
+                'CANCELAMENTO',
+                message,
+                mensagemCancelamento,
+                etapaAnterior,
+                'CANCELADO',
+                { operacao: operacaoAtual }
+            );
             return;
         }
 
@@ -310,8 +450,23 @@ client.on('message', async msg => {
     // Etapas para exclusão de Categoria via Menu.
     if (userState[user]?.etapa === 'aguardando_codigo_exclusao') {
         if (message.toLowerCase() === 'cancelar') {
-            userState[user] = { etapa: 'menu_categorias' };
-            await client.sendMessage(user, 'Operação cancelada com sucesso.');
+            const etapaAnterior = userState[user]?.etapa || 'desconhecida';
+            const operacaoAtual = userState[user]?.tipo || 'OPERACAO';
+            delete userState[user];
+            
+            const mensagemCancelamento = 'Operação cancelada.';
+            await client.sendMessage(user, mensagemCancelamento);
+            
+            // Log do cancelamento
+            await registrarInteracao(
+                user,
+                'CANCELAMENTO',
+                message,
+                mensagemCancelamento,
+                etapaAnterior,
+                'CANCELADO',
+                { operacao: operacaoAtual }
+            );
             return;
         }
         await deleteCategoriaFromDB(user, message); // Usa o código informado para excluir
@@ -348,8 +503,23 @@ client.on('message', async msg => {
 
     if (userState[user]?.etapa === 'selecionar_categoria_exclusao') {
         if (message.toLowerCase() === 'cancelar') {
+            const etapaAnterior = userState[user]?.etapa || 'desconhecida';
+            const operacaoAtual = userState[user]?.tipo || 'OPERACAO';
             delete userState[user];
-            await client.sendMessage(user, 'Operação cancelada com sucesso.');
+            
+            const mensagemCancelamento = 'Operação cancelada.';
+            await client.sendMessage(user, mensagemCancelamento);
+            
+            // Log do cancelamento
+            await registrarInteracao(
+                user,
+                'CANCELAMENTO',
+                message,
+                mensagemCancelamento,
+                etapaAnterior,
+                'CANCELADO',
+                { operacao: operacaoAtual }
+            );
             return;
         }
     
@@ -394,8 +564,23 @@ client.on('message', async msg => {
 
     // Atalho da chamada que cancela a operação.
     if (message.toLowerCase() === 'cancelar') {
+        const etapaAnterior = userState[user]?.etapa || 'desconhecida';
+        const operacaoAtual = userState[user]?.tipo || 'OPERACAO';
         delete userState[user];
-        await client.sendMessage(user, 'Operação cancelada.');
+        
+        const mensagemCancelamento = 'Operação cancelada.';
+        await client.sendMessage(user, mensagemCancelamento);
+        
+        // Log do cancelamento
+        await registrarInteracao(
+            user,
+            'CANCELAMENTO',
+            message,
+            mensagemCancelamento,
+            etapaAnterior,
+            'CANCELADO',
+            { operacao: operacaoAtual }
+        );
         return;
     }
 

@@ -1,5 +1,6 @@
 // wallets.js - Módulo para gerenciamento de carteiras
 const { getConnection, sql } = require('./database');
+const { registrarInteracao } = require('./interactionLog');
 
 // Função para obter o próximo código válido para carteiras
 const getNextCodigo = async (user) => {
@@ -70,6 +71,18 @@ const saveCarteiraToDB = async (user, descricao, tipo) => {
 
         if (check.recordset[0].Count > 0) {
             console.error(`Código ${codigo} já existe para o usuário ${user}, gerando novo código...`);
+            
+            // Log de conflito de código
+            await registrarInteracao(
+                user,
+                'CARTEIRA_CONFLITO',
+                `Código ${codigo} já existe`,
+                null,
+                'verificacao_codigo',
+                'CONFLITO',
+                { codigo, descricao, tipo }
+            );
+            
             codigo = await getNextCodigo(user); // Tenta gerar novamente
         }
 
@@ -80,9 +93,38 @@ const saveCarteiraToDB = async (user, descricao, tipo) => {
             .input('Tipo', sql.NVarChar, tipo)
             .query("INSERT INTO Carteiras (Usuario, Codigo, Descricao, Tipo) VALUES (@Usuario, @Codigo, @Descricao, @Tipo)");
         
-        return `Carteira cadastrada com sucesso! Código: ${codigo}`;
+        const mensagem = `Carteira cadastrada com sucesso! Código: ${codigo}`;
+        
+        // Log de sucesso no cadastro
+        await registrarInteracao(
+            user,
+            'CARTEIRA_CADASTRO',
+            `${descricao} (${tipo})`,
+            mensagem,
+            'cadastro_carteira',
+            'SUCESSO',
+            { codigo, descricao, tipo }
+        );
+        
+        return mensagem;
     } catch (err) {
         console.error('Erro ao cadastrar carteira:', err);
+        
+        // Log de erro no cadastro
+        await registrarInteracao(
+            user,
+            'CARTEIRA_CADASTRO',
+            `${descricao} (${tipo})`,
+            'Erro ao cadastrar carteira.',
+            'cadastro_carteira',
+            'ERRO',
+            { 
+                descricao, 
+                tipo,
+                erro: err.message 
+            }
+        );
+        
         return 'Erro ao cadastrar carteira.';
     }
 };
@@ -153,14 +195,40 @@ const exibirSaldo = async (client, user, carteiraCodigo) => {
     const carteiraCodigoInt = parseInt(carteiraCodigo, 10);
     
     if (isNaN(carteiraCodigoInt)) {
-        await client.sendMessage(user, 'Código de carteira inválido. Deve ser um número.');
+        const mensagemErro = 'Código de carteira inválido. Deve ser um número.';
+        await client.sendMessage(user, mensagemErro);
+        
+        // Log de erro - código inválido
+        await registrarInteracao(
+            user,
+            'CONSULTA_SALDO',
+            carteiraCodigo.toString(),
+            mensagemErro,
+            'validacao_codigo',
+            'ERRO',
+            { codigoInvalido: carteiraCodigo }
+        );
+        
         return;
     }
     
     const carteiraId = await getCarteiraIdPorCodigo(user, carteiraCodigoInt);
     
     if (!carteiraId) {
-        await client.sendMessage(user, 'Carteira não encontrada. Verifique o código informado.');
+        const mensagemErro = 'Carteira não encontrada. Verifique o código informado.';
+        await client.sendMessage(user, mensagemErro);
+        
+        // Log de erro - carteira não encontrada
+        await registrarInteracao(
+            user,
+            'CONSULTA_SALDO',
+            carteiraCodigoInt.toString(),
+            mensagemErro,
+            'busca_carteira',
+            'ERRO',
+            { carteiraCodigo: carteiraCodigoInt }
+        );
+        
         return;
     }
     
@@ -185,32 +253,91 @@ const exibirSaldo = async (client, user, carteiraCodigo) => {
         maximumFractionDigits: 2
     }).format(saldo);
 
-    await client.sendMessage(user, `O saldo da carteira selecionada é: ${saldoFormatado}`);
+    const mensagemSaldo = `O saldo da carteira selecionada é: ${saldoFormatado}`;
+    await client.sendMessage(user, mensagemSaldo);
+    
+    // Log de consulta de saldo com sucesso
+    await registrarInteracao(
+        user,
+        'CONSULTA_SALDO',
+        carteiraCodigoInt.toString(),
+        mensagemSaldo,
+        'exibicao_saldo',
+        'SUCESSO',
+        { 
+            carteiraCodigo: carteiraCodigoInt,
+            carteiraId,
+            saldo
+        }
+    );
     
     return true;
 };
 
 // Função para listar carteiras
 const listarCarteiras = async (client, user) => {
-    const pool = await getConnection();
-    const result = await pool.request()
-        .input('Usuario', sql.NVarChar, user)
-        .query(`
-            SELECT Codigo, Descricao
-            FROM Carteiras
-            WHERE Usuario = @Usuario OR Usuario = 'GERAL' OR Usuario IS NULL
-            ORDER BY Codigo
-        `);
-    
-    const carteiras = result.recordset;
-    
-    if (carteiras.length === 0) {
-        await client.sendMessage(user, 'Nenhuma carteira encontrada.');
-        return;
+    try {
+        const pool = await getConnection();
+        const result = await pool.request()
+            .input('Usuario', sql.NVarChar, user)
+            .query(`
+                SELECT Codigo, Descricao
+                FROM Carteiras
+                WHERE Usuario = @Usuario OR Usuario = 'GERAL' OR Usuario IS NULL
+                ORDER BY Codigo
+            `);
+        
+        const carteiras = result.recordset;
+        
+        if (carteiras.length === 0) {
+            const mensagem = 'Nenhuma carteira encontrada.';
+            await client.sendMessage(user, mensagem);
+            
+            // Log de lista vazia
+            await registrarInteracao(
+                user,
+                'LISTAR_CARTEIRAS',
+                'Listar carteiras',
+                mensagem,
+                'listagem',
+                'VAZIO',
+                {}
+            );
+            return;
+        }
+        
+        const carteiraMsg = carteiras.map(c => `${c.Codigo} - ${c.Descricao}`).join('\n');
+        await client.sendMessage(user, `Suas carteiras:\n${carteiraMsg}`);
+        
+        // Log de listagem bem-sucedida
+        await registrarInteracao(
+            user,
+            'LISTAR_CARTEIRAS',
+            'Listar carteiras',
+            `${carteiras.length} carteiras listadas`,
+            'listagem',
+            'SUCESSO',
+            { 
+                quantidade: carteiras.length,
+                codigos: carteiras.map(c => c.Codigo)
+            }
+        );
+    } catch (error) {
+        console.error('Erro ao listar carteiras:', error);
+        
+        // Log de erro na listagem
+        await registrarInteracao(
+            user,
+            'LISTAR_CARTEIRAS',
+            'Listar carteiras',
+            'Erro ao listar carteiras',
+            'listagem',
+            'ERRO',
+            { erro: error.message }
+        );
+        
+        await client.sendMessage(user, 'Ocorreu um erro ao listar suas carteiras.');
     }
-    
-    const carteiraMsg = carteiras.map(c => `${c.Codigo} - ${c.Descricao}`).join('\n');
-    await client.sendMessage(user, `Suas carteiras:\n${carteiraMsg}`);
 };
 
 module.exports = { getNextCodigo, getCarteiras, saveCarteiraToDB, getCarteiraIdPorCodigo, consultarSaldo, exibirSaldo, listarCarteiras };

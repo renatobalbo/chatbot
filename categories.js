@@ -1,5 +1,6 @@
 // categories.js - Módulo para gerenciamento de categorias
 const { getConnection, sql } = require('./database');
+const { registrarInteracao } = require('./interactionLog');
 
 // Função para obter o próximo código válido para categorias
 const getNextCodigo = async (user) => {
@@ -65,9 +66,38 @@ const saveCategoriaToDB = async (user, descricao) => {
             .input('Codigo', sql.Int, codigo)
             .input('Descricao', sql.NVarChar, descricao)
             .query("INSERT INTO Categorias (Usuario, Codigo, Descricao) VALUES (@Usuario, @Codigo, @Descricao)");
-        return `Categoria cadastrada com sucesso! Código: ${codigo}`;
+        
+        const mensagem = `Categoria cadastrada com sucesso! Código: ${codigo}`;
+        
+        // Log de cadastro bem-sucedido
+        await registrarInteracao(
+            user,
+            'CATEGORIA_CADASTRO',
+            descricao,
+            mensagem,
+            'cadastro_categoria',
+            'SUCESSO',
+            { codigo, descricao }
+        );
+        
+        return mensagem;
     } catch (err) {
         console.error('Erro ao cadastrar categoria:', err);
+        
+        // Log de erro no cadastro
+        await registrarInteracao(
+            user,
+            'CATEGORIA_CADASTRO',
+            descricao,
+            'Erro ao cadastrar categoria.',
+            'cadastro_categoria',
+            'ERRO',
+            { 
+                descricao,
+                erro: err.message 
+            }
+        );
+        
         return 'Erro ao cadastrar categoria.';
     }
 };
@@ -90,31 +120,104 @@ const checkCategoriaExists = async (user, descricao) => {
 
 // Função para verificar se uma categoria está em uso
 const checkCategoriaInUse = async (user, codigoCategoria) => {
-    const pool = await getConnection();
-    const result = await pool.request()
-        .input('Usuario', sql.NVarChar, user)
-        .input('CodigoCategoria', sql.Int, codigoCategoria)
-        .query(`
-            SELECT TOP 1 1
-            FROM Movimentacoes
-            WHERE Usuario = @Usuario AND Categoria = @CodigoCategoria
-        `);
+    try {
+        const pool = await getConnection();
+        const result = await pool.request()
+            .input('Usuario', sql.NVarChar, user)
+            .input('CodigoCategoria', sql.Int, codigoCategoria)
+            .query(`
+                SELECT TOP 1 1
+                FROM Movimentacoes
+                WHERE Usuario = @Usuario AND Categoria = @CodigoCategoria
+            `);
 
-    return result.recordset.length > 0;
+        const emUso = result.recordset.length > 0;
+        
+        // Log da verificação
+        await registrarInteracao(
+            user,
+            'VERIFICACAO_CATEGORIA',
+            codigoCategoria.toString(),
+            emUso ? `Categoria ${codigoCategoria} está em uso` : `Categoria ${codigoCategoria} não está em uso`,
+            'verificacao_uso',
+            'VERIFICADO',
+            { 
+                codigo: codigoCategoria,
+                emUso
+            }
+        );
+
+        return emUso;
+    } catch (error) {
+        console.error('Erro ao verificar uso da categoria:', error);
+        
+        // Log de erro na verificação
+        await registrarInteracao(
+            user,
+            'VERIFICACAO_CATEGORIA',
+            codigoCategoria.toString(),
+            `Erro ao verificar uso: ${error.message}`,
+            'verificacao_uso',
+            'ERRO',
+            { 
+                codigo: codigoCategoria,
+                erro: error.message 
+            }
+        );
+        
+        // Em caso de erro, assumir que está em uso por segurança
+        return true;
+    }
 };
 
 // Função para excluir uma categoria do banco de dados
 const deleteCategoriaFromDB = async (user, codigoCategoria) => {
-    const pool = await getConnection();
-    const result = await pool.request()
-        .input('Usuario', sql.NVarChar, user)
-        .input('CodigoCategoria', sql.Int, codigoCategoria)
-        .query(`
-            DELETE FROM Categorias
-            WHERE Usuario = @Usuario AND Codigo = @CodigoCategoria
-        `);
+    try {
+        const pool = await getConnection();
+        const result = await pool.request()
+            .input('Usuario', sql.NVarChar, user)
+            .input('CodigoCategoria', sql.Int, codigoCategoria)
+            .query(`
+                DELETE FROM Categorias
+                WHERE Usuario = @Usuario AND Codigo = @CodigoCategoria
+            `);
 
-    return result.rowsAffected[0] > 0;
+        const sucesso = result.rowsAffected[0] > 0;
+        
+        // Log da operação de exclusão
+        await registrarInteracao(
+            user,
+            'CATEGORIA_EXCLUSAO',
+            codigoCategoria.toString(),
+            sucesso ? `Categoria ${codigoCategoria} excluída` : `Categoria ${codigoCategoria} não encontrada`,
+            'exclusao_categoria',
+            sucesso ? 'SUCESSO' : 'FALHA',
+            { 
+                codigo: codigoCategoria,
+                linhasAfetadas: result.rowsAffected[0]
+            }
+        );
+
+        return sucesso;
+    } catch (error) {
+        console.error('Erro ao excluir categoria:', error);
+        
+        // Log de erro na exclusão
+        await registrarInteracao(
+            user,
+            'CATEGORIA_EXCLUSAO',
+            codigoCategoria.toString(),
+            `Erro ao excluir categoria: ${error.message}`,
+            'exclusao_categoria',
+            'ERRO',
+            { 
+                codigo: codigoCategoria,
+                erro: error.message 
+            }
+        );
+        
+        return false;
+    }
 };
 
 // Função para listar categorias
@@ -134,15 +237,58 @@ const listCategorias = async (user) => {
 
 // Função para enviar a lista de categorias ao usuário
 const listarCategorias = async (client, user) => {
-    const categorias = await listCategorias(user);
-    
-    if (categorias.length === 0) {
-        await client.sendMessage(user, 'Nenhuma categoria encontrada.');
-        return;
+    try {
+        const categorias = await listCategorias(user);
+        
+        if (categorias.length === 0) {
+            const mensagem = 'Nenhuma categoria encontrada.';
+            await client.sendMessage(user, mensagem);
+            
+            // Log de lista vazia
+            await registrarInteracao(
+                user,
+                'LISTAR_CATEGORIAS',
+                'Listar categorias',
+                mensagem,
+                'listagem',
+                'VAZIO',
+                {}
+            );
+            return;
+        }
+        
+        const categoriaMsg = categorias.map(c => `${c.Codigo} - ${c.Descricao}`).join('\n');
+        await client.sendMessage(user, `Suas categorias:\n${categoriaMsg}`);
+        
+        // Log de listagem bem-sucedida
+        await registrarInteracao(
+            user,
+            'LISTAR_CATEGORIAS',
+            'Listar categorias',
+            `${categorias.length} categorias listadas`,
+            'listagem',
+            'SUCESSO',
+            { 
+                quantidade: categorias.length,
+                codigos: categorias.map(c => c.Codigo)
+            }
+        );
+    } catch (error) {
+        console.error('Erro ao listar categorias:', error);
+        
+        // Log de erro na listagem
+        await registrarInteracao(
+            user,
+            'LISTAR_CATEGORIAS',
+            'Listar categorias',
+            'Erro ao listar categorias',
+            'listagem',
+            'ERRO',
+            { erro: error.message }
+        );
+        
+        await client.sendMessage(user, 'Ocorreu um erro ao listar suas categorias.');
     }
-    
-    const categoriaMsg = categorias.map(c => `${c.Codigo} - ${c.Descricao}`).join('\n');
-    await client.sendMessage(user, `Suas categorias:\n${categoriaMsg}`);
 };
 
 // Exportar todas as funções relacionadas a categorias

@@ -1,8 +1,27 @@
 const fs = require('fs');
 const ExcelJS = require('exceljs');
+const { registrarInteracao } = require('./interactionLog');
 
-async function generateXmlReport(movimentacoes, carteira, periodo, filePath) {
+async function generateXmlReport(movimentacoes, carteira, periodo, filePath, usuario) {
   try {
+    // Log de início da geração XML
+    if (usuario) {
+      await registrarInteracao(
+        usuario,
+        'XML_GERACAO_INICIO',
+        'Início da geração do XML/Excel',
+        null,
+        'geracao_xml',
+        'INICIADO',
+        {
+          carteira,
+          periodo,
+          totalMovimentacoes: movimentacoes?.length || 0,
+          filePath
+        }
+      );
+    }
+
     // Criar diretório de relatórios se não existir
     const reportsDir = './reports';
     if (!fs.existsSync(reportsDir)) {
@@ -104,6 +123,22 @@ async function generateXmlReport(movimentacoes, carteira, periodo, filePath) {
       { state: 'frozen', xSplit: 0, ySplit: 1, activeCell: 'A2' }
     ];
 
+    // Após configurar a aba principal
+    if (usuario) {
+      await registrarInteracao(
+        usuario,
+        'XML_ABA_PRINCIPAL',
+        'Extrato principal',
+        'Configuração da aba principal de extrato',
+        'configuracao_planilha',
+        'SUCESSO',
+        {
+          carteira,
+          qtdMovimentacoes: movimentacoes?.length || 0
+        }
+      );
+    }
+
     // ===== ABA DE DETALHAMENTO POR CATEGORIA =====
     const detailSheet = workbook.addWorksheet('Por Categoria', {
       properties: { tabColor: { argb: '4F81BD' } }
@@ -180,6 +215,22 @@ async function generateXmlReport(movimentacoes, carteira, periodo, filePath) {
       color: { argb: totalGeral >= 0 ? '008000' : 'FF0000' }
     };
     
+    // Após configurar a aba de detalhamento por categoria
+    if (usuario) {
+      await registrarInteracao(
+        usuario,
+        'XML_ABA_CATEGORIAS',
+        'Detalhamento por categorias',
+        'Configuração da aba de categorias',
+        'configuracao_planilha',
+        'SUCESSO',
+        {
+          carteira,
+          qtdCategorias: Object.keys(categorias || {}).length
+        }
+      );
+    }
+
     // ===== ABA DE RESUMO =====
     const summarySheet = workbook.addWorksheet('Resumo', {
       properties: { tabColor: { argb: '9BBB59' } }
@@ -238,16 +289,104 @@ async function generateXmlReport(movimentacoes, carteira, periodo, filePath) {
     summarySheet.getColumn('A').width = 20;
     summarySheet.getColumn('B').width = 14;
     
+    // Após configurar a aba de resumo
+    if (usuario) {
+      await registrarInteracao(
+        usuario,
+        'XML_ABA_RESUMO',
+        'Resumo',
+        'Configuração da aba de resumo',
+        'configuracao_planilha',
+        'SUCESSO',
+        {
+          carteira,
+          creditos,
+          debitos,
+          saldo: creditos - debitos
+        }
+      );
+    }
+
     // Salvar o arquivo
-    await workbook.xlsx.writeFile(filePath);
-    
-    if (!fs.existsSync(filePath)) {
-      console.error('Arquivo não encontrado após tentativa de gravação!');
+    try {
+      await workbook.xlsx.writeFile(filePath);
+      
+      // Verificar se o arquivo foi salvo corretamente
+      if (!fs.existsSync(filePath)) {
+        console.error('Arquivo não encontrado após tentativa de gravação!');
+        
+        if (usuario) {
+          await registrarInteracao(
+            usuario,
+            'XML_ERRO_ARQUIVO',
+            filePath,
+            'Arquivo não encontrado após gravação',
+            'verificacao_arquivo',
+            'ERRO',
+            { filePath }
+          );
+        }
+      } else {
+        // Obter estatísticas do arquivo
+        const stats = fs.statSync(filePath);
+        
+        if (usuario) {
+          await registrarInteracao(
+            usuario,
+            'XML_GERACAO_SUCESSO',
+            filePath,
+            `Arquivo Excel gerado com sucesso: ${stats.size} bytes`,
+            'geracao_xml',
+            'SUCESSO',
+            {
+              filePath,
+              tamanhoBytes: stats.size,
+              qtdMovimentacoes: movimentacoes?.length || 0
+            }
+          );
+        }
+      }
+    } catch (writeError) {
+      console.error('Erro ao escrever arquivo Excel:', writeError);
+      
+      if (usuario) {
+        await registrarInteracao(
+          usuario,
+          'XML_ERRO_GRAVACAO',
+          filePath,
+          `Erro ao gravar arquivo Excel: ${writeError.message}`,
+          'gravacao_arquivo',
+          'ERRO',
+          {
+            filePath,
+            erro: writeError.message
+          }
+        );
+      }
+      
+      throw writeError;
     }
     
     return filePath;
   } catch (error) {
     console.error('Erro ao gerar relatório Excel:', error);
+    
+    if (usuario) {
+      await registrarInteracao(
+        usuario,
+        'XML_ERRO_GERAL',
+        carteira?.toString() || 'desconhecida',
+        `Erro ao gerar relatório Excel: ${error.message}`,
+        'geracao_xml',
+        'ERRO',
+        {
+          carteira,
+          periodo,
+          erro: error.message
+        }
+      );
+    }
+    
     throw new Error('Ocorreu um erro ao gerar o relatório Excel.');
   }
 }

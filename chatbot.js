@@ -5,8 +5,11 @@ const { Client } = require('whatsapp-web.js');
 
 const { getConnection, sql } = require('./database');
 const { generateStatementReport } = require('./reports');
-
+const { getCarteiras, saveCarteiraToDB, getCarteiraIdPorCodigo, consultarSaldo, exibirSaldo, listarCarteiras } = require('./wallets');
+const { getCategorias, saveCategoriaToDB, checkCategoriaExists, checkCategoriaInUse, deleteCategoriaFromDB, listCategorias, listarCategorias } = require('./categories');
 const simpleGit = require('simple-git');
+
+const userManager = require('./userManagement');
 
 const git = simpleGit({
   baseDir: process.cwd(),
@@ -30,74 +33,6 @@ client.on('ready', () => {
 
 // Estado do usuário
 const userState = {};
-
-// Função para obter o próximo código válido.
-const getNextCodigo = async (table, user) => {
-    try {
-        let pool = await getConnection();
-        let result = await pool.request()
-            .input('Usuario', sql.NVarChar, user)
-            .query(`
-                SELECT ISNULL(MAX(Codigo), 0) + 1 AS NextCodigo
-                FROM ${table}
-                WHERE Usuario = @Usuario OR Usuario = 'GERAL'
-            `);
-
-        let nextCodigo = result.recordset[0].NextCodigo;
-
-        // Certifica-se de que o código ainda não existe para o usuário específico
-        let check = await pool.request()
-            .input('Usuario', sql.NVarChar, user)
-            .input('Codigo', sql.Int, nextCodigo)
-            .query(`SELECT COUNT(*) AS Count FROM ${table} WHERE Usuario = @Usuario AND Codigo = @Codigo`);
-
-        if (check.recordset[0].Count > 0) {
-            // Se já existir, busca o próximo disponível
-            let resultAlt = await pool.request()
-                .input('Usuario', sql.NVarChar, user)
-                .query(`
-                    SELECT MIN(Codigo + 1) AS NextCodigo 
-                    FROM ${table} 
-                    WHERE Usuario = @Usuario 
-                    AND (Codigo + 1) NOT IN (SELECT Codigo FROM ${table} WHERE Usuario = @Usuario)
-                `);
-
-            nextCodigo = resultAlt.recordset[0].NextCodigo || nextCodigo;
-        }
-        return nextCodigo;
-    } catch (err) {
-        console.error(`Erro ao obter próximo código para ${table}:`, err);
-        return 1;
-    }
-};
-
-// Função para obter opções de carteira do usuário.
-const getCarteiras = async (user) => {
-    try {
-        let pool = await getConnection();
-        let result = await pool.request()
-            .input('Usuario', sql.NVarChar, user)
-            .query("SELECT Codigo, Descricao FROM Carteiras WHERE Usuario = @Usuario OR Usuario = 'GERAL'");
-        return result.recordset;
-    } catch (err) {
-        console.error('Erro ao buscar carteiras:', err);
-        return [];
-    }
-};
-
-// Função para obter opções de categoria do usuário.
-const getCategorias = async (user) => {
-    try {
-        let pool = await getConnection();
-        let result = await pool.request()
-            .input('Usuario', sql.NVarChar, user)
-            .query("SELECT Codigo, Descricao FROM Categorias WHERE Usuario = @Usuario OR Usuario = 'GERAL'");
-        return result.recordset;
-    } catch (err) {
-        console.error('Erro ao buscar categorias:', err);
-        return [];
-    }
-};
 
 // Função para salvar movimentações no banco.
 const saveTransactionToDB = async (user, tipo, valor, carteiraCodigo, categoria) => {
@@ -129,55 +64,6 @@ const saveTransactionToDB = async (user, tipo, valor, carteiraCodigo, categoria)
     }
 };
 
-// Função para cadastrar carteira.
-const saveCarteiraToDB = async (user, descricao, tipo) => {
-    try {
-        let pool = await getConnection();
-
-        let codigo = await getNextCodigo('Carteiras', user);
-
-        // Verifica se o código gerado já existe
-        let check = await pool.request()
-            .input('Usuario', sql.NVarChar, user)
-            .input('Codigo', sql.Int, codigo)
-            .query("SELECT COUNT(*) AS Count FROM Carteiras WHERE Usuario = @Usuario AND Codigo = @Codigo");
-
-        if (check.recordset[0].Count > 0) {
-            console.error(`Código ${codigo} já existe para o usuário ${user}, gerando novo código...`);
-            codigo = await getNextCodigo('Carteiras', user); // Tenta gerar novamente
-        }
-
-        await pool.request()
-            .input('Usuario', sql.NVarChar, user)
-            .input('Codigo', sql.Int, codigo)
-            .input('Descricao', sql.NVarChar, descricao)
-            .input('Tipo', sql.NVarChar, tipo)
-            .query("INSERT INTO Carteiras (Usuario, Codigo, Descricao, Tipo) VALUES (@Usuario, @Codigo, @Descricao, @Tipo)");
-        
-        return `Carteira cadastrada com sucesso! Código: ${codigo}`;
-    } catch (err) {
-        console.error('Erro ao cadastrar carteira:', err);
-        return 'Erro ao cadastrar carteira.';
-    }
-};
-
-// Função para cadastrar categoria.
-const saveCategoriaToDB = async (user, descricao) => {
-    try {
-        let codigo = await getNextCodigo('Categorias', user);
-        let pool = await getConnection();
-        await pool.request()
-            .input('Usuario', sql.NVarChar, user)
-            .input('Codigo', sql.Int, codigo)
-            .input('Descricao', sql.NVarChar, descricao)
-            .query("INSERT INTO Categorias (Usuario, Codigo, Descricao) VALUES (@Usuario, @Codigo, @Descricao)");
-        return `Categoria cadastrada com sucesso! Código: ${codigo}`;
-    } catch (err) {
-        console.error('Erro ao cadastrar categoria:', err);
-        return 'Erro ao cadastrar categoria.';
-    }
-};
-
 // Montagem das Mensagens.
 client.on('message', async msg => {
     const user = msg.from;
@@ -205,7 +91,10 @@ client.on('message', async msg => {
                 await client.sendMessage(user, 'Informe o valor da saída:');
                 break;
             case '3':
-                await consultarSaldo(user);
+                const result = await consultarSaldo(client, user);
+                if (result && result.etapa) {
+                    userState[user].etapa = result.etapa;
+                }
                 break;
             case '4':
                 userState[user] = { etapa: 'menu_carteiras' };
@@ -227,7 +116,7 @@ client.on('message', async msg => {
     if (userState[user]?.etapa === 'menu_carteiras' && ['1', '2'].includes(message)) {
         switch (message) {
             case '1':
-                await listarCarteiras(user);
+                await listarCarteiras(client, user);
                 break;
             case '2':
                 userState[user] = { etapa: 'descricao_carteira' };
@@ -241,7 +130,7 @@ client.on('message', async msg => {
     if (userState[user]?.etapa === 'menu_categorias' && ['1', '2', '3'].includes(message)) {
         switch (message) {
             case '1':
-                await listarCategorias(user);
+                await listarCategorias(client, user);
                 break;
             case '2':
                 userState[user] = { etapa: 'descricao_categoria' };
@@ -281,7 +170,16 @@ client.on('message', async msg => {
             await client.sendMessage(user, 'Valor inválido. Por favor, digite um número válido.');
             return;
         }
-        userState[user].valor = valor.toFixed(2);
+        userState[user].valor = valor.toFixed(2); // Manter o valor original formatado para cálculos
+    
+        // Adicionar uma propriedade para o valor formatado para exibição
+        userState[user].valorFormatado = new Intl.NumberFormat('pt-BR', {
+            style: 'currency',
+            currency: 'BRL',
+            minimumFractionDigits: 2,
+            maximumFractionDigits: 2
+        }).format(valor);
+        
         const carteiras = await getCarteiras(user);
 
         if (carteiras.length === 1 && carteiras[0].Codigo === 1) { // Verificação ajustada para número
@@ -324,12 +222,11 @@ client.on('message', async msg => {
         }
         userState[user].categoria = categoriaSelecionada.Codigo;
         userState[user].etapa = 'confirmacao';
-
-
+    
+    
         const carteiras = await getCarteiras(user); // Busca a lista de carteiras novamente
         const carteiraDescricao = carteiras.find(c => c.Codigo === userState[user].carteira)?.Descricao || 'Não encontrado';
-        
-        const resumo = `Confirme os dados:\nTipo: ${userState[user].tipo}\nValor: ${userState[user].valor}\nCarteira: ${userState[user].carteira} - ${carteiraDescricao}\nCategoria: ${categoriaSelecionada.Codigo} - ${categoriaSelecionada.Descricao}\nResponda "Ok" para salvar.`;
+        const resumo = `Confirme os dados:\nTipo: ${userState[user].tipo}\nValor: ${userState[user].valorFormatado}\nCarteira: ${userState[user].carteira} - ${carteiraDescricao}\nCategoria: ${categoriaSelecionada.Codigo} - ${categoriaSelecionada.Descricao}\nResponda "Ok" para salvar.`;
         
         await client.sendMessage(user, resumo);
         
@@ -410,21 +307,6 @@ client.on('message', async msg => {
         return;
     }
 
-    // Função para verificar se uma categoria está em uso
-    async function checkCategoriaInUse(user, codigoCategoria) {
-        const pool = await getConnection();
-        const result = await pool.request()
-            .input('Usuario', sql.NVarChar, user)
-            .input('CodigoCategoria', sql.Int, codigoCategoria)
-            .query(`
-                SELECT TOP 1 1
-                FROM Movimentacoes
-                WHERE Usuario = @Usuario AND Categoria = @CodigoCategoria
-            `);
-
-        return result.recordset.length > 0;
-    }
-
     // Etapas para exclusão de Categoria via Menu.
     if (userState[user]?.etapa === 'aguardando_codigo_exclusao') {
         if (message.toLowerCase() === 'cancelar') {
@@ -436,20 +318,6 @@ client.on('message', async msg => {
         userState[user] = { etapa: 'menu_categorias' }; // Volta pro menu de categorias após a exclusão
         await client.sendMessage(user, 'Categoria excluída com sucesso!');
         return;
-    }
-
-    // Função para excluir uma categoria do banco de dados
-    async function deleteCategoriaFromDB(user, codigoCategoria) {
-        const pool = await getConnection();
-        const result = await pool.request()
-            .input('Usuario', sql.NVarChar, user)
-            .input('CodigoCategoria', sql.Int, codigoCategoria)
-            .query(`
-                DELETE FROM Categorias
-                WHERE Usuario = @Usuario AND Codigo = @CodigoCategoria
-            `);
-
-        return result.rowsAffected[0] > 0;
     }
 
     // Atalho da chamada de Exclusão de Categoria.
@@ -533,95 +401,26 @@ client.on('message', async msg => {
 
     // Atalho da chamada de Saldo.
     if (message.toLowerCase() === 'saldo') {
-        await consultarSaldo(user);
+        const result = await consultarSaldo(client, user);
+        if (result && result.etapa) {
+            userState[user].etapa = result.etapa;
+        }
         return;
     }
 
     // Atalho da chamada Listar Carteiras.
     if (message.toLowerCase() === 'listar carteiras') {
-        await listarCarteiras(user);
+        await listarCarteiras(client, user);
         return;
     }
         
     // Atalho da chamada Listar Categorias.
     if (message.toLowerCase() === 'listar categorias') {
-        await listarCategorias(user);
+        await listarCategorias(client, user);
         return;
     }
 
-    // Função que pega as carteiras de um usuário.
-    async function getCarteiraIdPorCodigo(user, codigo) {
-        const pool = await getConnection();
-        const result = await pool.request()
-            .input('Usuario', sql.NVarChar, user)
-            .input('Codigo', sql.Int, codigo)
-            .query(`
-            SELECT TOP 1 ID 
-            FROM Carteiras 
-            WHERE Codigo = @Codigo 
-                AND (Usuario = @Usuario OR Usuario = 'GERAL' OR Usuario IS NULL)
-            ORDER BY Usuario DESC
-            `);
-        
-        return result.recordset[0]?.ID;
-    }
-
-    // Função para checar a categoria.
-    async function checkCategoriaExists(user, descricao) {
-        try {
-            const pool = await getConnection();
-            const result = await pool.request()
-                .input('usuario', sql.VarChar, user)
-                .input('descricao', sql.VarChar, descricao)
-                .query(`SELECT COUNT(*) AS count FROM Categorias WHERE Usuario = @usuario AND Descricao = @descricao`);
-    
-            return result.recordset[0].count > 0;
-        } catch (error) {
-            console.error('Erro ao verificar categoria existente:', error);
-            throw error;
-        }
-    }
-
-    // Função para Listar Categorias para Exclusão.
-    async function listCategorias(user) {
-        const pool = await getConnection();
-        const result = await pool.request()
-            .input('Usuario', sql.NVarChar, user)
-            .query(`
-                SELECT Codigo, Descricao, Usuario
-                FROM Categorias
-                WHERE Usuario = @Usuario OR Usuario = 'GERAL' OR Usuario IS NULL
-                ORDER BY Codigo
-            `);
-    
-        const categorias = result.recordset;
-    
-        if (categorias.length === 0) {
-            await client.sendMessage(user, 'Nenhuma categoria encontrada.');
-        }
-
-        return categorias;
-    }
-
-    // Função para consultar saldo.
-    async function consultarSaldo(user) {
-        const carteiras = await getCarteiras(user);
-        
-        if (carteiras.length === 0) {
-            await client.sendMessage(user, 'Você não tem nenhuma carteira cadastrada.');
-            return;
-        }
-        
-        if (carteiras.length === 1) {
-            const carteiraSelecionada = carteiras[0].Codigo;
-            await exibirSaldo(user, carteiraSelecionada);
-        } else {
-            userState[user].etapa = 'selecionarCarteiraSaldo';
-            const carteiraMsg = carteiras.map(c => `${c.Codigo} - ${c.Descricao}`).join('\n');
-            await client.sendMessage(user, `Escolha uma carteira para verificar o saldo:\n${carteiraMsg}\n(Envie o código da carteira)`);
-        }
-    }
-        
+    // Lidar com seleção de carteira para saldo
     if (userState[user]?.etapa === 'selecionarCarteiraSaldo') {
         const carteiras = await getCarteiras(user);
         const carteiraSelecionada = carteiras.find(c => c.Codigo === parseInt(message));
@@ -631,83 +430,124 @@ client.on('message', async msg => {
             return;
         }
         
-        await exibirSaldo(user, carteiraSelecionada.Codigo);
-    }
-        
-    async function exibirSaldo(user, carteiraCodigo) {
-        const carteiraId = await getCarteiraIdPorCodigo(user, carteiraCodigo);
-        
-        if (!carteiraId) {
-            await client.sendMessage(user, 'Carteira não encontrada. Verifique o código informado.');
-            return;
-        }
-        
-        const pool = await getConnection();
-        const result = await pool.request()
-            .input('Usuario', sql.VarChar, user)
-            .input('Carteira', sql.Int, carteiraId)
-            .query(`
-            SELECT 
-                (SELECT ISNULL(SUM(Valor), 0) FROM Movimentacoes WHERE Usuario = @Usuario AND Carteira = @Carteira AND Tipo = 'Crédito') -
-                (SELECT ISNULL(SUM(Valor), 0) FROM Movimentacoes WHERE Usuario = @Usuario AND Carteira = @Carteira AND Tipo = 'Débito') 
-            AS Saldo
-            `);    
-        
-        const saldo = result.recordset[0]?.Saldo ?? 0;
-        
-        await client.sendMessage(user, `O saldo da carteira selecionada é: R$ ${saldo.toFixed(2)}`);
-        
-        delete userState[user].carteira;
+        await exibirSaldo(client, user, carteiraSelecionada.Codigo);
         delete userState[user].etapa;
+        return;
     }
 
-    //Função Listar Carteiras    
-    async function listarCarteiras(user) {
-        const pool = await getConnection();
-        const result = await pool.request()
-            .input('Usuario', sql.NVarChar, user)
-            .query(`
-                SELECT Codigo, Descricao
-                FROM Carteiras
-                WHERE Usuario = @Usuario OR Usuario = 'GERAL' OR Usuario IS NULL
-                ORDER BY Codigo
-            `);
-        
-        const carteiras = result.recordset;
-        
-        if (carteiras.length === 0) {
-            await client.sendMessage(user, 'Nenhuma carteira encontrada.');
-            return;
-        }
-        
-        const carteiraMsg = carteiras.map(c => `${c.Codigo} - ${c.Descricao}`).join('\n');
-        await client.sendMessage(user, `Suas carteiras:\n${carteiraMsg}`);
+    // Adicionar novos comandos para gerenciar usuários (apenas para administradores)
+    async function isAdminUser(user) {
+        // Implementar lógica para identificar administradores
+        // Por exemplo, uma lista de números de telefone de administradores
+        const adminUsers = ['554396697747@c.us']; // Exemplo, substituir pelos números reais
+        return adminUsers.includes(user);
     }
     
-    //Função Listar Categorias
-    async function listarCategorias(user) {
-        const pool = await getConnection();
-        const result = await pool.request()
-            .input('Usuario', sql.NVarChar, user)
-            .query(`
-                SELECT Codigo, Descricao
-                FROM Categorias
-                WHERE Usuario = @Usuario OR Usuario = 'GERAL' OR Usuario IS NULL
-                ORDER BY Codigo
-            `);
-        
-        const categorias = result.recordset;
-        
-        if (categorias.length === 0) {
-            await client.sendMessage(user, 'Nenhuma categoria encontrada.');
-            return;
-        }
-        
-        const categoriaMsg = categorias.map(c => `${c.Codigo} - ${c.Descricao}`).join('\n');
-        await client.sendMessage(user, `Suas categorias:\n${categoriaMsg}`);
+    // Dentro do event handler 'message', adicionar os comandos de administração
+    if (message.toLowerCase() === 'admin menu' && await isAdminUser(user)) {
+        await client.sendMessage(user, 'Menu de Administração:\n1 - Listar Usuários\n2 - Tornar Usuário PRO\n3 - Desativar Usuário\n4 - Reativar Usuário');
+        userState[user] = { etapa: 'admin_menu' };
+        return;
     }
-    
-    module.exports = { exibirSaldo, consultarSaldo, listarCarteiras, listarCategorias };
+
+    // Processar a seleção do menu de administração
+    if (userState[user]?.etapa === 'admin_menu' && await isAdminUser(user)) {
+        switch (message) {
+            case '1': // Listar Usuários
+                // Implementar função para listar usuários
+                await listUsers(user);
+                break;
+            case '2': // Tornar Usuário PRO
+                userState[user] = { etapa: 'set_user_pro' };
+                await client.sendMessage(user, 'Digite o número do telefone do usuário que deseja tornar PRO (formato: 55119999999@c.us):');
+                break;
+            case '3': // Desativar Usuário
+                userState[user] = { etapa: 'deactivate_user' };
+                await client.sendMessage(user, 'Digite o número do telefone do usuário que deseja desativar (formato: 55119999999@c.us):');
+                break;
+            case '4': // Reativar Usuário
+                userState[user] = { etapa: 'reactivate_user' };
+                await client.sendMessage(user, 'Digite o número do telefone do usuário que deseja reativar (formato: 55119999999@c.us):');
+                break;
+        }
+        return;
+    }
+
+    // Implementar função para listar usuários (apenas para admins)
+    async function listUsers(adminUser) {
+        if (!await isAdminUser(adminUser)) return;
+        
+        try {
+            const pool = await getConnection();
+            const result = await pool.request()
+                .query(`
+                    SELECT TOP 20 Telefone, Nome, 
+                        CASE WHEN UsuarioPro = 1 THEN 'Sim' ELSE 'Não' END AS Pro,
+                        CASE WHEN Ativo = 1 THEN 'Sim' ELSE 'Não' END AS Ativo,
+                        FORMAT(UltimaAtividade, 'dd/MM/yyyy HH:mm') AS UltimaAtiv
+                    FROM Usuarios
+                    ORDER BY UltimaAtividade DESC
+                `);
+            
+            if (result.recordset.length === 0) {
+                await client.sendMessage(adminUser, 'Nenhum usuário registrado.');
+                return;
+            }
+            
+            let message = 'Últimos 20 usuários ativos:\n\n';
+            result.recordset.forEach(user => {
+                message += `📱 ${user.Telefone}\n`;
+                message += `👤 ${user.Nome || 'Nome não registrado'}\n`;
+                message += `✅ PRO: ${user.Pro} | Ativo: ${user.Ativo}\n`;
+                message += `⏱️ Última atividade: ${user.UltimaAtiv}\n\n`;
+            });
+            
+            await client.sendMessage(adminUser, message);
+        } catch (error) {
+            console.error('Erro ao listar usuários:', error);
+            await client.sendMessage(adminUser, 'Ocorreu um erro ao listar os usuários.');
+        }
+    }
+
+    // Processar comandos de administração de usuários
+    if (userState[user]?.etapa === 'set_user_pro' && await isAdminUser(user)) {
+        const targetUser = message.trim();
+        try {
+            await userManager.updateUserProStatus(targetUser, true);
+            await client.sendMessage(user, `Usuário ${targetUser} agora é PRO!`);
+        } catch (error) {
+            console.error('Erro ao atualizar status PRO:', error);
+            await client.sendMessage(user, 'Ocorreu um erro ao atualizar o status do usuário.');
+        }
+        delete userState[user];
+        return;
+    }
+
+    if (userState[user]?.etapa === 'deactivate_user' && await isAdminUser(user)) {
+        const targetUser = message.trim();
+        try {
+            await userManager.deactivateUser(targetUser);
+            await client.sendMessage(user, `Usuário ${targetUser} foi desativado.`);
+        } catch (error) {
+            console.error('Erro ao desativar usuário:', error);
+            await client.sendMessage(user, 'Ocorreu um erro ao desativar o usuário.');
+        }
+        delete userState[user];
+        return;
+    }
+
+    if (userState[user]?.etapa === 'reactivate_user' && await isAdminUser(user)) {
+        const targetUser = message.trim();
+        try {
+            await userManager.reactivateUser(targetUser);
+            await client.sendMessage(user, `Usuário ${targetUser} foi reativado.`);
+        } catch (error) {
+            console.error('Erro ao reativar usuário:', error);
+            await client.sendMessage(user, 'Ocorreu um erro ao reativar o usuário.');
+        }
+        delete userState[user];
+        return;
+    }
 
 });
 

@@ -1,0 +1,149 @@
+// categories.js - Módulo para gerenciamento de categorias
+const { getConnection, sql } = require('./database');
+
+// Função para obter o próximo código válido para categorias
+const getNextCodigo = async (user) => {
+    try {
+        let pool = await getConnection();
+        let result = await pool.request()
+            .input('Usuario', sql.NVarChar, user)
+            .query(`
+                SELECT ISNULL(MAX(Codigo), 0) + 1 AS NextCodigo
+                FROM Categorias
+                WHERE Usuario = @Usuario OR Usuario = 'GERAL'
+            `);
+
+        let nextCodigo = result.recordset[0].NextCodigo;
+
+        // Certifica-se de que o código ainda não existe para o usuário específico
+        let check = await pool.request()
+            .input('Usuario', sql.NVarChar, user)
+            .input('Codigo', sql.Int, nextCodigo)
+            .query(`SELECT COUNT(*) AS Count FROM Categorias WHERE Usuario = @Usuario AND Codigo = @Codigo`);
+
+        if (check.recordset[0].Count > 0) {
+            // Se já existir, busca o próximo disponível
+            let resultAlt = await pool.request()
+                .input('Usuario', sql.NVarChar, user)
+                .query(`
+                    SELECT MIN(Codigo + 1) AS NextCodigo 
+                    FROM Categorias 
+                    WHERE Usuario = @Usuario 
+                    AND (Codigo + 1) NOT IN (SELECT Codigo FROM Categorias WHERE Usuario = @Usuario)
+                `);
+
+            nextCodigo = resultAlt.recordset[0].NextCodigo || nextCodigo;
+        }
+        return nextCodigo;
+    } catch (err) {
+        console.error(`Erro ao obter próximo código para Categorias:`, err);
+        return 1;
+    }
+};
+
+// Função para obter opções de categoria do usuário
+const getCategorias = async (user) => {
+    try {
+        let pool = await getConnection();
+        let result = await pool.request()
+            .input('Usuario', sql.NVarChar, user)
+            .query("SELECT Codigo, Descricao FROM Categorias WHERE Usuario = @Usuario OR Usuario = 'GERAL'");
+        return result.recordset;
+    } catch (err) {
+        console.error('Erro ao buscar categorias:', err);
+        return [];
+    }
+};
+
+// Função para cadastrar categoria
+const saveCategoriaToDB = async (user, descricao) => {
+    try {
+        let codigo = await getNextCodigo(user);
+        let pool = await getConnection();
+        await pool.request()
+            .input('Usuario', sql.NVarChar, user)
+            .input('Codigo', sql.Int, codigo)
+            .input('Descricao', sql.NVarChar, descricao)
+            .query("INSERT INTO Categorias (Usuario, Codigo, Descricao) VALUES (@Usuario, @Codigo, @Descricao)");
+        return `Categoria cadastrada com sucesso! Código: ${codigo}`;
+    } catch (err) {
+        console.error('Erro ao cadastrar categoria:', err);
+        return 'Erro ao cadastrar categoria.';
+    }
+};
+
+// Função para verificar se uma categoria já existe
+const checkCategoriaExists = async (user, descricao) => {
+    try {
+        const pool = await getConnection();
+        const result = await pool.request()
+            .input('usuario', sql.VarChar, user)
+            .input('descricao', sql.VarChar, descricao)
+            .query(`SELECT COUNT(*) AS count FROM Categorias WHERE Usuario = @usuario AND Descricao = @descricao`);
+
+        return result.recordset[0].count > 0;
+    } catch (error) {
+        console.error('Erro ao verificar categoria existente:', error);
+        throw error;
+    }
+};
+
+// Função para verificar se uma categoria está em uso
+const checkCategoriaInUse = async (user, codigoCategoria) => {
+    const pool = await getConnection();
+    const result = await pool.request()
+        .input('Usuario', sql.NVarChar, user)
+        .input('CodigoCategoria', sql.Int, codigoCategoria)
+        .query(`
+            SELECT TOP 1 1
+            FROM Movimentacoes
+            WHERE Usuario = @Usuario AND Categoria = @CodigoCategoria
+        `);
+
+    return result.recordset.length > 0;
+};
+
+// Função para excluir uma categoria do banco de dados
+const deleteCategoriaFromDB = async (user, codigoCategoria) => {
+    const pool = await getConnection();
+    const result = await pool.request()
+        .input('Usuario', sql.NVarChar, user)
+        .input('CodigoCategoria', sql.Int, codigoCategoria)
+        .query(`
+            DELETE FROM Categorias
+            WHERE Usuario = @Usuario AND Codigo = @CodigoCategoria
+        `);
+
+    return result.rowsAffected[0] > 0;
+};
+
+// Função para listar categorias
+const listCategorias = async (user) => {
+    const pool = await getConnection();
+    const result = await pool.request()
+        .input('Usuario', sql.NVarChar, user)
+        .query(`
+            SELECT Codigo, Descricao, Usuario
+            FROM Categorias
+            WHERE Usuario = @Usuario OR Usuario = 'GERAL' OR Usuario IS NULL
+            ORDER BY Codigo
+        `);
+
+    return result.recordset;
+};
+
+// Função para enviar a lista de categorias ao usuário
+const listarCategorias = async (client, user) => {
+    const categorias = await listCategorias(user);
+    
+    if (categorias.length === 0) {
+        await client.sendMessage(user, 'Nenhuma categoria encontrada.');
+        return;
+    }
+    
+    const categoriaMsg = categorias.map(c => `${c.Codigo} - ${c.Descricao}`).join('\n');
+    await client.sendMessage(user, `Suas categorias:\n${categoriaMsg}`);
+};
+
+// Exportar todas as funções relacionadas a categorias
+module.exports = { getCategorias, saveCategoriaToDB, checkCategoriaExists, checkCategoriaInUse, deleteCategoriaFromDB, listCategorias, listarCategorias };

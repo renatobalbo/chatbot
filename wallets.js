@@ -140,8 +140,6 @@ const getCarteiraIdPorCodigo = async (user, codigo) => {
             return null;
         }
         
-        console.log(`Buscando carteira com código EXATO: ${codigoInt} (tipo: ${typeof codigoInt})`);
-        
         const pool = await getConnection();
         const result = await pool.request()
             .input('Usuario', sql.NVarChar, user)
@@ -159,7 +157,6 @@ const getCarteiraIdPorCodigo = async (user, codigo) => {
             return null;
         }
         
-        console.log(`Carteira encontrada - ID: ${result.recordset[0].ID}, Código: ${codigoInt}`);
         return result.recordset[0].ID;
     } catch (error) {
         console.error('Erro ao obter ID da carteira:', error);
